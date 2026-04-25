@@ -2,7 +2,6 @@
 
 <img src="./src/assets/logo.png" alt="OpenTextFlow Logo" width="220" />
 
-[查看/打开 Logo 文件](./src/assets/logo.png)
 
 OpenTextFlow 是一款**基于AI的Word文档优化器**。  
 OpenTextFlow is an **AI-powered Word document optimizer**.

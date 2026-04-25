@@ -2,7 +2,6 @@
 
 <img src="./src/assets/logo.png" alt="OpenTextFlow Logo" width="220" />
 
-[View/Open logo file](./src/assets/logo.png)
 
 OpenTextFlow is an **AI-powered Word document optimizer** designed to improve document quality, editing efficiency, and revision traceability.
 
