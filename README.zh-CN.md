@@ -1,6 +1,6 @@
 ﻿# OpenTextFlow（中文说明）
 
-![OpenTextFlow Logo](./src/assets/logo.png)
+![LOGO](public/logo.png)
 
 
 OpenTextFlow 是一款**基于AI的Word文档优化器**，用于提升文档表达质量、编辑效率与可追踪性。
