@@ -1,22 +1,33 @@
 import { app, BrowserWindow, ipcMain, dialog } from 'electron';
-import path from 'path';
-import fs from 'fs';
-import os from 'os';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
 let mainWindow: BrowserWindow | null;
 let db: DatabaseSync | null;
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const isDev = process.env.NODE_VENV === 'development' || !app.isPackaged;
 
 function resolveAppIconPath() {
-    const devIcon = path.join(process.cwd(), 'public', 'logo.png');
-    const packagedIcon = path.join(app.getAppPath(), 'dist', 'logo.png');
-    if (fs.existsSync(devIcon)) {
-        return devIcon;
+    const devIco = path.join(process.cwd(), 'public', 'logo.ico');
+    const devPng = path.join(process.cwd(), 'public', 'logo.png');
+    const packagedIco = path.join(app.getAppPath(), 'dist', 'logo.ico');
+    const packagedPng = path.join(app.getAppPath(), 'dist', 'logo.png');
+    if (fs.existsSync(devIco)) {
+        return devIco;
     }
-    if (fs.existsSync(packagedIcon)) {
-        return packagedIcon;
+    if (fs.existsSync(packagedIco)) {
+        return packagedIco;
+    }
+    if (fs.existsSync(devPng)) {
+        return devPng;
+    }
+    if (fs.existsSync(packagedPng)) {
+        return packagedPng;
     }
     return undefined;
 }

@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && tsc -p electron/tsconfig.json",
-    "dist:win": "npm run build && electron-builder --win",
+    "dist:win": "npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win",
     "lint": "eslint .",
     "preview": "vite preview"
   },
@@ -23,11 +23,24 @@
       "electron/**",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "public/logo.ico",
+        "to": "logo.ico"
+      }
+    ],
     "win": {
       "target": [
         "nsis"
       ],
-      "icon": "public/logo.png"
+      "icon": "public/logo.ico",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "installerIcon": "public/logo.ico",
+      "uninstallerIcon": "public/logo.ico",
+      "installerHeaderIcon": "public/logo.ico",
+      "include": "build/installer.nsh"
     }
   },
   "dependencies": {
