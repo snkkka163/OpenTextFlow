@@ -1,6 +1,6 @@
 ﻿# OpenTextFlow (English)
 
-![OpenTextFlow Logo](./src/assets/logo.png)
+![LOGO](public/logo.png)
 
 
 OpenTextFlow is an **AI-powered Word document optimizer** designed to improve document quality, editing efficiency, and revision traceability.
