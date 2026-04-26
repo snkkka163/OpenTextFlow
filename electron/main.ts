@@ -53,6 +53,9 @@ interface AIConfigRecord {
     apiUrl: string;
     apiKey: string;
     modelName: string;
+    reviewerApiUrl: string;
+    reviewerApiKey: string;
+    reviewerModelName: string;
 }
 
 function getDatabase() {
@@ -107,6 +110,9 @@ function initializeDatabase() {
                 apiUrl TEXT NOT NULL,
                 apiKey TEXT NOT NULL,
                 modelName TEXT NOT NULL,
+                reviewerApiUrl TEXT,
+                reviewerApiKey TEXT,
+                reviewerModelName TEXT,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             
@@ -114,6 +120,25 @@ function initializeDatabase() {
             CREATE INDEX IF NOT EXISTS idx_edit_history_timestamp ON edit_history(timestamp);
             CREATE INDEX IF NOT EXISTS idx_ai_agents_is_default ON ai_agents(isDefault);
         `);
+
+        const aiConfigColumns = db.prepare('PRAGMA table_info(ai_config)').all() as Array<{ name: string }>;
+        if (!aiConfigColumns.some((column) => column.name === 'reviewerModelName')) {
+            db.exec('ALTER TABLE ai_config ADD COLUMN reviewerModelName TEXT');
+        }
+        if (!aiConfigColumns.some((column) => column.name === 'reviewerApiUrl')) {
+            db.exec('ALTER TABLE ai_config ADD COLUMN reviewerApiUrl TEXT');
+        }
+        if (!aiConfigColumns.some((column) => column.name === 'reviewerApiKey')) {
+            db.exec('ALTER TABLE ai_config ADD COLUMN reviewerApiKey TEXT');
+        }
+
+        db.prepare(
+            `UPDATE ai_config
+             SET reviewerApiUrl = COALESCE(NULLIF(reviewerApiUrl, ''), apiUrl),
+                 reviewerApiKey = COALESCE(NULLIF(reviewerApiKey, ''), apiKey),
+                 reviewerModelName = COALESCE(NULLIF(reviewerModelName, ''), modelName)
+             WHERE id = 1`
+        ).run();
 
         const countRow = db
             .prepare('SELECT COUNT(*) AS count FROM ai_agents')
@@ -136,8 +161,8 @@ function initializeDatabase() {
             seedStmt.run(
                 'academic-polisher',
                 '学术润色助手',
-                '用于提升学术文本的清晰度、自然度和表达质量。',
-                'You are an academic polishing assistant. Rewrite the provided text to make it clearer, more natural, and more human-like while preserving the original meaning. Keep a formal, objective, academic tone. Use varied sentence structures and precise wording. Provide ONLY the rewritten text.',
+                '用于在保持学术严谨的前提下优化表达并尽量降低AI痕迹。',
+                'You are an academic writing editor whose primary goal is to reduce AI-detectable style while preserving the author\'s meaning and evidence. Edit conservatively: keep sentence order, paragraph structure, and most wording from the original; only fix clear grammar, terminology, and logic issues. Avoid over-polished template language, repetitive connectors, and uniformly perfect rhythm. Keep a formal academic tone but retain natural human variation. Do not add new facts, citations, or claims. Output only the revised text.',
                 0
             );
         }
@@ -146,8 +171,8 @@ function initializeDatabase() {
         const legacyAgentId = 'aigc-reducer';
         const upgradedAgentId = 'academic-polisher';
         const upgradedAgentName = '学术润色助手';
-        const upgradedAgentDescription = '用于提升学术文本的清晰度、自然度和表达质量。';
-        const upgradedSystemPrompt = 'You are an academic polishing assistant. Rewrite the provided text to make it clearer, more natural, and more human-like while preserving the original meaning. Keep a formal, objective, academic tone. Use varied sentence structures and precise wording. Provide ONLY the rewritten text.';
+        const upgradedAgentDescription = '用于在保持学术严谨的前提下优化表达并尽量降低AI痕迹。';
+        const upgradedSystemPrompt = 'You are an academic writing editor whose primary goal is to reduce AI-detectable style while preserving the author\'s meaning and evidence. Edit conservatively: keep sentence order, paragraph structure, and most wording from the original; only fix clear grammar, terminology, and logic issues. Avoid over-polished template language, repetitive connectors, and uniformly perfect rhythm. Keep a formal academic tone but retain natural human variation. Do not add new facts, citations, or claims. Output only the revised text.';
 
         const legacyAgentRow = db
             .prepare('SELECT id FROM ai_agents WHERE id = ?')
@@ -422,7 +447,15 @@ ipcMain.handle('db:getAIConfig', async () => {
     try {
         const database = getDatabase();
         const stmt = database.prepare(
-            'SELECT apiUrl, apiKey, modelName FROM ai_config WHERE id = 1'
+            `SELECT
+                apiUrl,
+                apiKey,
+                modelName,
+                COALESCE(NULLIF(reviewerApiUrl, ''), apiUrl) AS reviewerApiUrl,
+                COALESCE(NULLIF(reviewerApiKey, ''), apiKey) AS reviewerApiKey,
+                COALESCE(NULLIF(reviewerModelName, ''), modelName) AS reviewerModelName
+             FROM ai_config
+             WHERE id = 1`
         );
         const row = stmt.get();
         return { success: true, data: row || null };
@@ -435,22 +468,39 @@ ipcMain.handle('db:getAIConfig', async () => {
 ipcMain.handle('db:saveAIConfig', async (event, payload) => {
     try {
         const config = payload as AIConfigRecord;
-        if (!config?.apiUrl || !config?.apiKey || !config?.modelName) {
+        if (
+            !config?.apiUrl ||
+            !config?.apiKey ||
+            !config?.modelName ||
+            !config?.reviewerApiUrl ||
+            !config?.reviewerApiKey ||
+            !config?.reviewerModelName
+        ) {
             return { success: false, error: 'Missing required AI config fields' };
         }
 
         const database = getDatabase();
         const stmt = database.prepare(
-            `INSERT INTO ai_config (id, apiUrl, apiKey, modelName, updated_at)
-             VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP)
+            `INSERT INTO ai_config (id, apiUrl, apiKey, modelName, reviewerApiUrl, reviewerApiKey, reviewerModelName, updated_at)
+             VALUES (1, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
              ON CONFLICT(id) DO UPDATE SET
                apiUrl = excluded.apiUrl,
                apiKey = excluded.apiKey,
                modelName = excluded.modelName,
+               reviewerApiUrl = excluded.reviewerApiUrl,
+               reviewerApiKey = excluded.reviewerApiKey,
+               reviewerModelName = excluded.reviewerModelName,
                updated_at = CURRENT_TIMESTAMP`
         );
 
-        stmt.run(config.apiUrl, config.apiKey, config.modelName);
+        stmt.run(
+            config.apiUrl,
+            config.apiKey,
+            config.modelName,
+            config.reviewerApiUrl,
+            config.reviewerApiKey,
+            config.reviewerModelName
+        );
 
         return { success: true };
     } catch (error: any) {

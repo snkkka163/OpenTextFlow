@@ -26,6 +26,224 @@ interface DiffSegment {
     text: string;
 }
 
+interface AIConfigValues {
+    apiUrl: string;
+    apiKey: string;
+    modelName: string;
+    reviewerApiUrl: string;
+    reviewerApiKey: string;
+    reviewerModelName: string;
+}
+
+type AIProcessStage = 'idle' | 'editing' | 'reviewing';
+
+interface RateScore {
+    aiRate: number;
+    humanRate: number;
+    reason?: string;
+}
+
+interface RevisionRateReview {
+    before: RateScore;
+    after: RateScore;
+    summary?: string;
+    reviewerModel: string;
+}
+
+interface ChatMessage {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+}
+
+function resolveChatCompletionEndpoint(apiUrl: string) {
+    const baseUrl = apiUrl.replace(/\/$/, '');
+    if (baseUrl.endsWith('/v1') || baseUrl.includes('/chat/completions')) {
+        return `${baseUrl}/chat/completions`.replace('/chat/completions/chat/completions', '/chat/completions');
+    }
+    return `${baseUrl}/v1/chat/completions`;
+}
+
+function extractCompletionText(payload: any) {
+    const data = payload?.data || payload;
+    if (!data?.choices || data.choices.length === 0) {
+        return null;
+    }
+    return data.choices[0].message?.content || data.choices[0].text || null;
+}
+
+async function requestChatCompletion(
+    config: Pick<AIConfigValues, 'apiUrl' | 'apiKey'>,
+    model: string,
+    messages: ChatMessage[],
+) {
+    const endpoint = resolveChatCompletionEndpoint(config.apiUrl);
+    const res = await axios.post(
+        endpoint,
+        { model, messages },
+        {
+            headers: {
+                Authorization: `Bearer ${config.apiKey}`,
+                'Content-Type': 'application/json',
+            },
+        },
+    );
+
+    const text = extractCompletionText(res.data);
+    if (!text || typeof text !== 'string') {
+        throw new Error(t('message.responseFormatError'));
+    }
+    return text.trim();
+}
+
+function clampRate(value: number) {
+    const bounded = Math.max(0, Math.min(100, value));
+    return Math.round(bounded * 10) / 10;
+}
+
+function formatRate(value: number) {
+    return `${value.toFixed(1).replace(/\.0$/, '')}%`;
+}
+
+function pickNumber(...candidates: unknown[]) {
+    for (const candidate of candidates) {
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return candidate;
+        }
+        if (typeof candidate === 'string') {
+            const parsed = Number(candidate.replace('%', '').trim());
+            if (Number.isFinite(parsed)) {
+                return parsed;
+            }
+        }
+    }
+    return null;
+}
+
+function extractJsonBlock(content: string) {
+    const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced?.[1]) {
+        return fenced[1].trim();
+    }
+    const firstBrace = content.indexOf('{');
+    const lastBrace = content.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+        return content.slice(firstBrace, lastBrace + 1);
+    }
+    return null;
+}
+
+function normalizeRateScore(raw: any) {
+    if (!raw || typeof raw !== 'object') {
+        return null;
+    }
+
+    const aiRateRaw = pickNumber(
+        raw.aiRate,
+        raw.ai_rate,
+        raw.ai,
+        raw.aiPercentage,
+    );
+    const humanRateRaw = pickNumber(
+        raw.humanRate,
+        raw.human_rate,
+        raw.human,
+        raw.humanPercentage,
+    );
+
+    if (aiRateRaw === null && humanRateRaw === null) {
+        return null;
+    }
+
+    const aiRate = clampRate(aiRateRaw ?? (100 - (humanRateRaw as number)));
+    const humanRate = clampRate(humanRateRaw ?? (100 - aiRate));
+
+    return {
+        aiRate,
+        humanRate,
+        reason: typeof raw.reason === 'string' ? raw.reason.trim() : undefined,
+    } as RateScore;
+}
+
+function parseRateReview(content: string, reviewerModel: string): RevisionRateReview {
+    const jsonBlock = extractJsonBlock(content);
+    if (!jsonBlock) {
+        throw new Error('Reviewer model did not return JSON');
+    }
+
+    const parsed = JSON.parse(jsonBlock);
+    const before = normalizeRateScore(
+        parsed.before || parsed.pre || {
+            aiRate: parsed.beforeAiRate,
+            humanRate: parsed.beforeHumanRate,
+            reason: parsed.beforeReason,
+        },
+    );
+    const after = normalizeRateScore(
+        parsed.after || parsed.post || {
+            aiRate: parsed.afterAiRate,
+            humanRate: parsed.afterHumanRate,
+            reason: parsed.afterReason,
+        },
+    );
+
+    if (!before || !after) {
+        throw new Error('Reviewer model JSON is missing before/after rates');
+    }
+
+    return {
+        before,
+        after,
+        summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : undefined,
+        reviewerModel,
+    };
+}
+
+async function getRevisionRateReview(
+    config: AIConfigValues,
+    sourceText: string,
+    revisedText: string,
+) {
+    const reviewSystemPrompt = [
+        'You are a strict writing reviewer.',
+        'Estimate AI-likelihood and human-likelihood for two versions of text: before edit and after edit.',
+        'Return JSON only, no markdown and no extra text.',
+        'Required JSON schema:',
+        '{',
+        '  "before": { "aiRate": number, "humanRate": number, "reason": string },',
+        '  "after": { "aiRate": number, "humanRate": number, "reason": string },',
+        '  "summary": string',
+        '}',
+        'Rules:',
+        '- aiRate and humanRate must be in [0,100].',
+        '- aiRate + humanRate should equal 100 for each side.',
+        '- reason should be brief and evidence-based.',
+    ].join('\n');
+
+    const reviewUserPrompt = [
+        'Please evaluate the following two text versions.',
+        '',
+        '[Before]',
+        sourceText,
+        '',
+        '[After]',
+        revisedText,
+    ].join('\n');
+
+    const content = await requestChatCompletion(
+        {
+            apiUrl: config.reviewerApiUrl,
+            apiKey: config.reviewerApiKey,
+        },
+        config.reviewerModelName,
+        [
+            { role: 'system', content: reviewSystemPrompt },
+            { role: 'user', content: reviewUserPrompt },
+        ],
+    );
+
+    return parseRateReview(content, config.reviewerModelName);
+}
+
 function getInitialAIPanelRatio() {
     const saved = localStorage.getItem(AI_PANEL_RATIO_KEY);
     if (!saved) {
@@ -244,6 +462,8 @@ export default function DocViewer({ docPath }: DocViewerProps) {
     const [searchQuery, setSearchQuery] = useState('');
     const [searchActiveIndex, setSearchActiveIndex] = useState(-1);
     const [searchTotal, setSearchTotal] = useState(0);
+    const [revisionRateReview, setRevisionRateReview] = useState<RevisionRateReview | null>(null);
+    const [aiProcessStage, setAiProcessStage] = useState<AIProcessStage>('idle');
 
     useEffect(() => {
         localStorage.setItem(AI_PANEL_RATIO_KEY, String(aiPanelRatio));
@@ -312,6 +532,7 @@ export default function DocViewer({ docPath }: DocViewerProps) {
         ) {
             setAiSuggestions(null);
             setSuggestionBaseText(null);
+            setRevisionRateReview(null);
         }
     }, [selectedText, aiSuggestions, suggestionBaseText]);
 
@@ -456,13 +677,28 @@ export default function DocViewer({ docPath }: DocViewerProps) {
             return;
         }
 
-        const config = configResult.data as {
-            apiUrl: string;
-            apiKey: string;
-            modelName: string;
+        const configData = configResult.data as Partial<AIConfigValues>;
+        const config: AIConfigValues = {
+            apiUrl: configData.apiUrl || '',
+            apiKey: configData.apiKey || '',
+            modelName: configData.modelName || '',
+            reviewerApiUrl: configData.reviewerApiUrl || configData.apiUrl || '',
+            reviewerApiKey: configData.reviewerApiKey || configData.apiKey || '',
+            reviewerModelName: configData.reviewerModelName || configData.modelName || '',
         };
+        if (
+            !config.modelName ||
+            !config.reviewerApiUrl ||
+            !config.reviewerApiKey ||
+            !config.reviewerModelName
+        ) {
+            message.error(t('doc.configureAI'));
+            return;
+        }
 
         setProcessingAi(true);
+        setAiProcessStage('editing');
+        setRevisionRateReview(null);
 
         const currentAgent = agents.find(a => a.id === selectedAgentId) || agents[0];
         const systemInstruction = currentAgent?.systemPrompt
@@ -470,51 +706,39 @@ export default function DocViewer({ docPath }: DocViewerProps) {
             : `You are an AI text editor. Review and improve the following text based on this instruction: ${prompt || 'Improve clarity and flow'}. Provide only the edited text, nothing else.`;
 
         try {
-            // Format URL to ensure it doesn't double-slash or missing v1 if common
-            const baseUrl = config.apiUrl.replace(/\/$/, "");
-            const endpoint = baseUrl.endsWith('/v1') || baseUrl.includes('/chat/completions')
-                ? `${baseUrl}/chat/completions`.replace('/chat/completions/chat/completions', '/chat/completions')
-                : `${baseUrl}/v1/chat/completions`;
-
-            // Standard OpenAI-compatible format
-            const res = await axios.post(endpoint, {
-                model: config.modelName,
-                messages: [
+            const aiResult = await requestChatCompletion(
+                {
+                    apiUrl: config.apiUrl,
+                    apiKey: config.apiKey,
+                },
+                config.modelName,
+                [
                     { role: 'system', content: systemInstruction },
-                    { role: 'user', content: sourceText }
-                ]
-            }, {
-                headers: {
-                    'Authorization': `Bearer ${config.apiKey}`,
-                    'Content-Type': 'application/json'
-                }
-            });
+                    { role: 'user', content: sourceText },
+                ],
+            );
 
-            const data = res.data?.data || res.data; // Handle wrapped proxy responses
+            markEditedRange(selectedRangeSnapshot);
+            setAiSuggestions(aiResult);
+            setSuggestionBaseText(sourceText);
+            setAiProcessStage('reviewing');
 
-            if (data && data.choices && data.choices.length > 0) {
-                const aiResult = data.choices[0].message?.content || data.choices[0].text; // Fallback for some models
-                if (aiResult) {
-                    markEditedRange(selectedRangeSnapshot);
-                    setAiSuggestions(aiResult);
-                    setSuggestionBaseText(sourceText);
-                    await saveEditHistory(sourceText, aiResult, currentAgent);
-                } else {
-                    message.error(t('message.responseFormatError'));
-                }
-            } else {
-                console.error("Unexpected AI response:", res.data);
-                Modal.error({
-                    title: t('message.unexpectedResponse'),
-                    content: <div style={{ wordWrap: 'break-word' }}>{JSON.stringify(res.data)}</div>
-                });
+            try {
+                const reviewResult = await getRevisionRateReview(config, sourceText, aiResult);
+                setRevisionRateReview(reviewResult);
+            } catch (reviewError: any) {
+                console.warn('Failed to review AI/human rate:', reviewError?.message || reviewError);
+                message.warning(t('doc.aiRateReviewFailed'));
             }
+
+            await saveEditHistory(sourceText, aiResult, currentAgent);
         } catch (err: any) {
             console.error("AI Error:", err.response?.data || err);
             const errDetail = err.response?.data?.error?.message || JSON.stringify(err.response?.data) || err.message;
             Modal.error({ title: t('message.apiError'), content: errDetail });
         } finally {
             setProcessingAi(false);
+            setAiProcessStage('idle');
         }
     };
 
@@ -717,7 +941,9 @@ export default function DocViewer({ docPath }: DocViewerProps) {
                                     style={{ borderRadius: '6px' }}
                                 />
                                 <Button type="primary" onClick={handleAIEdit} loading={processingAi} block style={{ background: 'linear-gradient(135deg, var(--forest-700) 0%, var(--forest-600) 100%)', border: 'none', borderRadius: '6px' }}>
-                                    {t('doc.generateEdit')}
+                                    {processingAi && aiProcessStage === 'reviewing'
+                                        ? t('doc.reviewing')
+                                        : t('doc.generateEdit')}
                                 </Button>
                             </div>
                         </Card>
@@ -725,8 +951,56 @@ export default function DocViewer({ docPath }: DocViewerProps) {
 
                     {aiSuggestions && (
                         <Card size="small" title={t('doc.aiSuggestion')} style={{ borderLeft: '4px solid var(--forest-600)', background: 'var(--glass-soft)' }}>
-                            <Spin spinning={processingAi}>
+                            <Spin
+                                spinning={aiProcessStage === 'reviewing'}
+                                tip={t('doc.reviewing')}
+                            >
                                 <div style={{ maxHeight: '400px', overflowY: 'auto', fontSize: '14px' }}>
+                                    {revisionRateReview && (
+                                        <div
+                                            style={{
+                                                marginBottom: '12px',
+                                                background: 'rgba(255, 248, 230, 0.85)',
+                                                border: '1px solid rgba(250, 173, 20, 0.35)',
+                                                borderRadius: '8px',
+                                                padding: '10px',
+                                            }}
+                                        >
+                                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                                {t('doc.aiRateReviewTitle')}
+                                            </div>
+                                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                                {t('doc.aiRateReviewModel')}: {revisionRateReview.reviewerModel}
+                                            </div>
+                                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                                                <div style={{ border: '1px solid rgba(63, 138, 95, 0.2)', borderRadius: '6px', padding: '8px', background: 'var(--doc-surface)' }}>
+                                                    <div style={{ fontWeight: 600, marginBottom: '4px' }}>{t('doc.aiRateBefore')}</div>
+                                                    <div>{t('doc.aiRateLabel')}: {formatRate(revisionRateReview.before.aiRate)}</div>
+                                                    <div>{t('doc.humanRateLabel')}: {formatRate(revisionRateReview.before.humanRate)}</div>
+                                                    {revisionRateReview.before.reason && (
+                                                        <div style={{ marginTop: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                                                            {t('doc.aiRateReasonLabel')}: {revisionRateReview.before.reason}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                <div style={{ border: '1px solid rgba(63, 138, 95, 0.2)', borderRadius: '6px', padding: '8px', background: 'var(--doc-surface)' }}>
+                                                    <div style={{ fontWeight: 600, marginBottom: '4px' }}>{t('doc.aiRateAfter')}</div>
+                                                    <div>{t('doc.aiRateLabel')}: {formatRate(revisionRateReview.after.aiRate)}</div>
+                                                    <div>{t('doc.humanRateLabel')}: {formatRate(revisionRateReview.after.humanRate)}</div>
+                                                    {revisionRateReview.after.reason && (
+                                                        <div style={{ marginTop: '6px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                                                            {t('doc.aiRateReasonLabel')}: {revisionRateReview.after.reason}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            {revisionRateReview.summary && (
+                                                <div style={{ marginTop: '8px', fontSize: '12px', color: 'var(--text-secondary)' }}>
+                                                    {t('doc.aiRateSummaryLabel')}: {revisionRateReview.summary}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
                                     <div style={{ marginBottom: '8px', color: 'var(--text-secondary)', fontSize: '12px' }}>
                                         {t('doc.inlineDiffLabel')}
                                     </div>
@@ -784,6 +1058,7 @@ export default function DocViewer({ docPath }: DocViewerProps) {
                                     onClick={() => {
                                         setAiSuggestions(null);
                                         setSuggestionBaseText(null);
+                                        setRevisionRateReview(null);
                                         setSelectedText('');
                                     }}
                                     style={{ borderRadius: '6px' }}
